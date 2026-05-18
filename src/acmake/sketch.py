@@ -127,6 +127,12 @@ _ARDUINO_H_INCLUDE_RE = re.compile(
     flags=re.MULTILINE | re.IGNORECASE,
 )
 
+# ``#if __has_include("h")`` must not be treated as ``#include``.
+_PREPROCESSOR_INCLUDE_RE = re.compile(
+    r"^\s*#\s*(?:include|import)\b",
+    flags=re.IGNORECASE,
+)
+
 
 def _split_param_list_top_level_commas(params: str) -> list[str]:
     """Split a parameter list on commas not nested inside ``()`` ``[]`` ``{}``."""
@@ -385,10 +391,8 @@ def _forward_decl_split_index(lines: list[str]) -> int:
             continue
         if _line_is_line_directive(s):
             continue
-        if s.startswith("#"):
-            low = s.lower()
-            if "include" in low or "import" in low:
-                last_after_include = i + 1
+        if _PREPROCESSOR_INCLUDE_RE.match(s):
+            last_after_include = i + 1
     return last_after_include
 
 

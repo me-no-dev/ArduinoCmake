@@ -144,6 +144,32 @@ def test_forward_decls_after_all_includes_when_code_precedes_include(tmp_path: P
     assert "void early();" in out[spi:]
 
 
+def test_has_include_inside_setup_does_not_move_protos(tmp_path: Path) -> None:
+    """``#if __has_include(...)`` inside ``setup()`` is not an ``#include`` directive."""
+    ino = tmp_path / "S" / "S.ino"
+    ino.parent.mkdir(parents=True)
+    ino.write_text(
+        '#include "Arduino.h"\n'
+        "#define X 1\n"
+        "static void helper() { }\n"
+        "void setup() {\n"
+        '#if __has_include("optional.h")\n'
+        "  helper();\n"
+        "#endif\n"
+        "}\n"
+        "void loop() {}\n",
+        encoding="utf-8",
+    )
+    out = build_sketch_cpp_body([ino])
+    proto = out.index("// acmake: forward declarations")
+    helper_impl = out.index("static void helper() {")
+    assert proto < helper_impl
+    assert "static void helper();" in out[proto:helper_impl]
+    setup_body = out.split("void setup() {", 1)[1].split("void loop()", 1)[0]
+    assert "// acmake: forward declarations" not in setup_body
+    assert '__has_include("optional.h")' in setup_body
+
+
 def test_forward_decls_after_last_include_before_define(tmp_path: Path) -> None:
     """Protos go after the final ``#include`` and before ``#define`` (Zigbee-style); ``#line`` matches that row."""
     ino = tmp_path / "S" / "S.ino"
