@@ -77,6 +77,22 @@ def test_forward_decl_skips_class_members_and_constructors(tmp_path: Path) -> No
     assert not any("C(int" in d for d in decls)
 
 
+def test_forward_decl_preserves_extern_c_linkage(tmp_path: Path) -> None:
+    """``extern "C"`` on a sketch function must appear on the generated prototype."""
+    ino = tmp_path / "S" / "S.ino"
+    ino.parent.mkdir(parents=True)
+    ino.write_text(
+        'extern "C" void c_api(int x) { (void)x; }\n'
+        "void setup() { c_api(1); }\n"
+        "void loop() {}\n",
+        encoding="utf-8",
+    )
+    decls = [d for _, _, d in extract_sketch_forward_declaration_entries([ino])]
+    assert any(d.strip() == 'extern "C" void c_api(int x);' for d in decls)
+    out = build_sketch_cpp_body([ino])
+    assert 'extern "C" void c_api(int x);' in out
+
+
 def test_forward_decl_preserves_static_specifier(tmp_path: Path) -> None:
     """``static`` (and similar leading specifiers) must appear on the prototype line."""
     ino = tmp_path / "S" / "S.ino"

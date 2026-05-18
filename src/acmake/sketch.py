@@ -62,6 +62,31 @@ def _strip_c_comments_and_strings_for_scan(src: str) -> str:
         ch = src[i]
         if ch in "\"'":
             quote = ch
+            if quote == '"' and re.search(r"\bextern\s*$", src[:i]):
+                j = i + 1
+                escaped = False
+                content_chars: list[str] = []
+                while j < n:
+                    if escaped:
+                        escaped = False
+                        content_chars.append(src[j])
+                    elif src[j] == "\\":
+                        escaped = True
+                    elif src[j] == quote:
+                        content = "".join(content_chars)
+                        if content in ("C", "C++"):
+                            out.append(src[i : j + 1])
+                        else:
+                            out.append(" " * (j - i + 1))
+                        i = j + 1
+                        break
+                    else:
+                        content_chars.append(src[j])
+                    j += 1
+                else:
+                    out.append(" " * (n - i))
+                    break
+                continue
             i += 1
             escaped = False
             while i < n:
