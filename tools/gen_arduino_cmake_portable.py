@@ -56,9 +56,11 @@ import sys
 import zipfile
 from pathlib import Path
 
+# codespell:ignore-begin
 _BUNDLE_CHUNKS = (
 {chunks_literal}
 )
+# codespell:ignore-end
 
 
 def _bundle_bytes() -> bytes:
