@@ -44,19 +44,20 @@ def resolve_size_command(expanded: dict[str, str]) -> tuple[str, str]:
     return basic, "basic"
 
 
-def _try_print_advanced_json(stdout: str) -> bool:
+def _try_print_advanced_json(stdout: str) -> tuple[bool, bool]:
+    """Return ``(handled, fits)``; *fits* is False when the recipe reports ``"severity": "error"``."""
     s = stdout.strip()
     if not s.startswith("{"):
-        return False
+        return False, True
     try:
         obj = json.loads(s)
     except json.JSONDecodeError:
-        return False
+        return False, True
     out = obj.get("output")
     if isinstance(out, str) and out.strip():
         print(out.rstrip())
-        return True
-    return False
+        return True, str(obj.get("severity", "")).lower() != "error"
+    return False, True
 
 
 def _sum_regex_matches(pattern: str, text: str) -> int | None:
@@ -125,23 +126,50 @@ def _basic_summary_lines(expanded: dict[str, str], stdout: str) -> list[str]:
     return lines
 
 
-def print_size_report(plan: BuildPlan) -> None:
-    """Run platform size recipe and print Arduino-style output (advanced JSON or basic regex summary only)."""
+def _int_or_none(s: str) -> int | None:
+    try:
+        v = int(s.strip())
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+def _basic_overflow_errors(expanded: dict[str, str], stdout: str) -> list[str]:
+    """Same limits as arduino-cli: program over ``upload.maximum_size`` or data over ``upload.maximum_data_size``."""
+    errors: list[str] = []
+    rx_p = (expanded.get("recipe.size.regex") or "").strip()
+    rx_d = (expanded.get("recipe.size.regex.data") or "").strip()
+    prog = _sum_regex_matches(rx_p, stdout) if rx_p else None
+    data = _sum_regex_matches(rx_d, stdout) if rx_d else None
+    max_p = _int_or_none(expanded.get("upload.maximum_size") or "")
+    max_d = _int_or_none(expanded.get("upload.maximum_data_size") or "")
+    if prog is not None and max_p is not None and prog > max_p:
+        errors.append(f"Sketch too big: {prog} bytes exceeds the maximum of {max_p} bytes.")
+    if data is not None and max_d is not None and data > max_d:
+        errors.append(f"Not enough memory: {data} bytes of dynamic memory exceeds the maximum of {max_d} bytes.")
+    return errors
+
+
+def print_size_report(plan: BuildPlan) -> bool:
+    """Run platform size recipe and print Arduino-style output (advanced JSON or basic regex summary only).
+
+    Returns False when the sketch does not fit the board limits.
+    """
     elf = plan.elf_path
     if not elf or not elf.is_file():
         print("Memory usage: (ELF not found; size report skipped)")
-        return
+        return True
 
     print("--- Memory usage ---")
     cmd, kind = resolve_size_command(plan.expanded)
     if not cmd:
         print("Memory usage: (no recipe.size.pattern / recipe.advanced_size.pattern for this platform)")
-        return
+        return True
 
     argv = split_recipe(cmd)
     if not argv:
         print("Memory usage: (size recipe expanded to empty command)")
-        return
+        return True
 
     bd = plan.build_dir.resolve()
     try:
@@ -166,16 +194,18 @@ def print_size_report(plan: BuildPlan) -> None:
     except OSError as e:
         logger.warning("size recipe failed to run: %s", e)
         print(f"Memory usage: (could not run size recipe: {e})")
-        return
+        return True
 
     out = (p.stdout or "").rstrip()
     err = (p.stderr or "").rstrip()
-    if kind == "advanced" and _try_print_advanced_json(p.stdout or ""):
-        if err:
-            print(err)
-        if p.returncode != 0:
-            logger.warning("advanced size recipe exited with code %s", p.returncode)
-        return
+    if kind == "advanced":
+        handled, fits = _try_print_advanced_json(p.stdout or "")
+        if handled:
+            if err:
+                print(err)
+            if p.returncode != 0:
+                logger.warning("advanced size recipe exited with code %s", p.returncode)
+            return fits
 
     if kind == "basic":
         lines = _basic_summary_lines(plan.expanded, p.stdout or "")
@@ -192,7 +222,10 @@ def print_size_report(plan: BuildPlan) -> None:
             print(err)
         if p.returncode != 0:
             logger.warning("size recipe exited with code %s", p.returncode)
-        return
+        errors = _basic_overflow_errors(plan.expanded, p.stdout or "")
+        for e in errors:
+            print(e)
+        return not errors
 
     if out:
         print(out)
@@ -200,6 +233,7 @@ def print_size_report(plan: BuildPlan) -> None:
         print(err)
     if p.returncode != 0:
         logger.warning("size recipe exited with code %s", p.returncode)
+    return True
 
 
 def print_library_report(plan: BuildPlan) -> None:

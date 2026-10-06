@@ -142,8 +142,11 @@ def cmd_compile(args: argparse.Namespace) -> int:
         ),
         verbose=args.verbose >= 2,
     )
-    print_size_report(plan)
+    fits = print_size_report(plan)
     print_library_report(plan)
+    if not fits:
+        log.error("build failed: sketch does not fit the selected board/partition scheme")
+        return 1
     log.info(
         "build finished: %s",
         plan.hex_path or plan.bin_path or plan.elf_path,
