@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from acmake.build import _library_bundle_dir, _object_cache_root_for_fqbn
-from acmake.cache_invalidate import _build_opt_fingerprint
+from acmake.cache_invalidate import _build_opt_fingerprint, sdk_config_fingerprint
 from acmake.fqbn import FQBN, path_component_from_label
 from acmake.libraries import Library
 
@@ -60,6 +60,41 @@ def test_object_cache_root_differs_for_build_opt_bytes(tmp_path: Path) -> None:
     fp_empty = _build_opt_fingerprint(bd_empty)
     assert r1.name == fqbn.object_cache_key(
         core_version="3.0.0", build_opt_fingerprint=fp_empty
+    )
+
+
+def test_object_cache_key_includes_sdk_fingerprint() -> None:
+    f = FQBN.parse("espressif:esp32:esp32s3")
+    base = f.object_cache_key(core_version="3.3.0")
+    a = f.object_cache_key(core_version="3.3.0", sdk_fingerprint="aa" * 32)
+    b = f.object_cache_key(core_version="3.3.0", sdk_fingerprint="bb" * 32)
+    assert a != b
+    assert a != base
+    assert b != base
+    # Empty fingerprint leaves the key unchanged (non-SDK toolchains).
+    assert f.object_cache_key(core_version="3.3.0", sdk_fingerprint="") == base
+
+
+def test_object_cache_root_differs_for_sdk_config(tmp_path: Path) -> None:
+    fqbn = FQBN.parse("espressif:esp32:esp32s3")
+    sdk = tmp_path / "esp32-arduino-libs" / "esp32s3"
+    (sdk / "flags").mkdir(parents=True)
+    (sdk / "sdkconfig").write_bytes(b"CONFIG_BT_AUDIO=n\n")
+    (sdk / "flags" / "defines").write_bytes(b"-DCONFIG_BT_AUDIO=0\n")
+    fp_before = sdk_config_fingerprint({"compiler.sdk.path": str(sdk)})
+    r1 = _object_cache_root_for_fqbn(fqbn, "3.3.0", sdk_fingerprint=fp_before)
+
+    # Regenerate the SDK with a flipped Kconfig symbol (same core version).
+    (sdk / "sdkconfig").write_bytes(b"CONFIG_BT_AUDIO=y\n")
+    (sdk / "flags" / "defines").write_bytes(b"-DCONFIG_BT_AUDIO=1\n")
+    fp_after = sdk_config_fingerprint({"compiler.sdk.path": str(sdk)})
+    r2 = _object_cache_root_for_fqbn(fqbn, "3.3.0", sdk_fingerprint=fp_after)
+
+    assert fp_before != fp_after
+    assert r1 != r2
+    assert r1.name != r2.name
+    assert r1.name == fqbn.object_cache_key(
+        core_version="3.3.0", sdk_fingerprint=fp_before
     )
 
 

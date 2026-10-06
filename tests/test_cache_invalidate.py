@@ -9,8 +9,88 @@ from acmake.cache_invalidate import (
     _platform_header_fingerprint,
     clear_entire_object_cache,
     maybe_refresh_object_cache,
+    sdk_config_fingerprint,
 )
 from acmake.libraries import Library
+
+
+def _make_sdk(root: Path, *, sdkconfig: bytes, defines: bytes) -> Path:
+    """Minimal ESP-style SDK tree: root ``sdkconfig`` + ``flags/defines``."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "sdkconfig").write_bytes(sdkconfig)
+    flags = root / "flags"
+    flags.mkdir(exist_ok=True)
+    (flags / "defines").write_bytes(defines)
+    return root
+
+
+def test_sdk_config_fingerprint_empty_without_sdk_path() -> None:
+    assert sdk_config_fingerprint({}) == ""
+    assert sdk_config_fingerprint({"compiler.sdk.path": "   "}) == ""
+
+
+def test_sdk_config_fingerprint_empty_when_tree_absent(tmp_path: Path) -> None:
+    missing = tmp_path / "nope"
+    assert sdk_config_fingerprint({"compiler.sdk.path": str(missing)}) == ""
+
+
+def test_sdk_config_fingerprint_changes_with_sdkconfig(tmp_path: Path) -> None:
+    sdk = _make_sdk(
+        tmp_path / "sdk",
+        sdkconfig=b"CONFIG_BT_AUDIO=n\n",
+        defines=b"-DCONFIG_FOO=1\n",
+    )
+    before = sdk_config_fingerprint({"compiler.sdk.path": str(sdk)})
+    (sdk / "sdkconfig").write_bytes(b"CONFIG_BT_AUDIO=y\n")
+    after = sdk_config_fingerprint({"compiler.sdk.path": str(sdk)})
+    assert before != after
+
+
+def test_sdk_config_fingerprint_changes_with_flags_defines(tmp_path: Path) -> None:
+    sdk = _make_sdk(
+        tmp_path / "sdk",
+        sdkconfig=b"CONFIG_BT_AUDIO=n\n",
+        defines=b"-DCONFIG_BT_AUDIO=0\n",
+    )
+    before = sdk_config_fingerprint({"compiler.sdk.path": str(sdk)})
+    (sdk / "flags" / "defines").write_bytes(b"-DCONFIG_BT_AUDIO=1\n")
+    after = sdk_config_fingerprint({"compiler.sdk.path": str(sdk)})
+    assert before != after
+
+
+def test_sdk_config_fingerprint_stable_and_location_independent(tmp_path: Path) -> None:
+    sdk_a = _make_sdk(
+        tmp_path / "a" / "esp32s3",
+        sdkconfig=b"CONFIG_BT_AUDIO=y\n",
+        defines=b"-DCONFIG_BT_AUDIO=1\n",
+    )
+    sdk_b = _make_sdk(
+        tmp_path / "b" / "esp32s3",
+        sdkconfig=b"CONFIG_BT_AUDIO=y\n",
+        defines=b"-DCONFIG_BT_AUDIO=1\n",
+    )
+    fp_a = sdk_config_fingerprint({"compiler.sdk.path": str(sdk_a)})
+    assert fp_a
+    assert fp_a == sdk_config_fingerprint({"compiler.sdk.path": str(sdk_a)})
+    # Keyed by filename + content only, so an identical SDK at a different path matches.
+    assert fp_a == sdk_config_fingerprint({"compiler.sdk.path": str(sdk_b)})
+
+
+def test_sdk_config_fingerprint_ignores_lib_and_ld(tmp_path: Path) -> None:
+    sdk = _make_sdk(
+        tmp_path / "sdk",
+        sdkconfig=b"CONFIG_BT_AUDIO=y\n",
+        defines=b"-DCONFIG_BT_AUDIO=1\n",
+    )
+    before = sdk_config_fingerprint({"compiler.sdk.path": str(sdk)})
+    lib = sdk / "lib"
+    lib.mkdir()
+    (lib / "libbt.a").write_bytes(b"\x00binary-archive-bytes\x00")
+    ld = sdk / "ld"
+    ld.mkdir()
+    (ld / "memory.ld").write_bytes(b"MEMORY { }\n")
+    after = sdk_config_fingerprint({"compiler.sdk.path": str(sdk)})
+    assert before == after
 
 
 def test_platform_header_fingerprint_ignores_build_opt(tmp_path: Path) -> None:

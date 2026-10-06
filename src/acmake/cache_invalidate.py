@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 
 from acmake.fqbn import path_component_from_label
@@ -125,6 +126,60 @@ def _fingerprint_library_cache_inputs(lib: Library) -> str:
     return h.hexdigest()
 
 
+def _sdk_config_input_paths(sdk_path: Path) -> list[Path]:
+    """Config-affecting files under an ESP-style SDK (``compiler.sdk.path``).
+
+    The generated ``sdkconfig`` plus every file under ``flags/`` (``defines``,
+    ``includes``, ``c_flags``, ``cpp_flags``, ``S_flags``, …). The recipe bakes these
+    straight onto every compile line via ``@flags/defines`` / ``@flags/*_flags`` and the
+    ``sdkconfig.h`` regenerated from ``sdkconfig`` is ``#include``-d by the core and
+    bundled libraries, so their bytes fully determine preprocessor config. They are small
+    (tens of KB total) and change whenever the SDK is regenerated with a different Kconfig.
+    The large precompiled ``lib/`` and ``ld/`` trees are intentionally excluded: they only
+    affect the (uncached) final link, not the ``.o`` files this cache stores.
+    """
+    out: list[Path] = []
+    sc = sdk_path / "sdkconfig"
+    if sc.is_file():
+        out.append(sc)
+    flags = sdk_path / "flags"
+    if flags.is_dir():
+        for p in sorted(flags.iterdir(), key=lambda x: x.name.lower()):
+            if p.is_file():
+                out.append(p)
+    return out
+
+
+def sdk_config_fingerprint(expanded: Mapping[str, str]) -> str:
+    """SHA-256 hex digest of the platform SDK config inputs, or ``""`` when there is none.
+
+    Resolves ``compiler.sdk.path`` from *expanded* properties and hashes the **contents**
+    of the config files under it (see ``_sdk_config_input_paths``), keyed by filename only
+    so the digest is stable across install locations. Toolchains that do not define
+    ``compiler.sdk.path`` (or whose SDK tree is absent) return ``""``, which leaves
+    ``FQBN.object_cache_key`` unchanged for them.
+    """
+    raw = (expanded.get("compiler.sdk.path") or "").strip()
+    if not raw:
+        return ""
+    sdk_path = Path(raw)
+    h = hashlib.sha256()
+    any_file = False
+    for p in _sdk_config_input_paths(sdk_path):
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        any_file = True
+        h.update(p.name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(data)
+        h.update(b"\n")
+    if not any_file:
+        return ""
+    return h.hexdigest()
+
+
 def _build_opt_bytes(build_dir: Path) -> bytes:
     """Raw ``build_opt.h`` bytes from *build_dir* (missing file is treated like empty).
 
@@ -210,12 +265,14 @@ def maybe_refresh_object_cache(
     **Platform headers** (core + variant) are fingerprinted under *cache_root* only —
     they do not depend on which sketch is being built.
 
-    **``build_opt.h``** does **not** trigger a global wipe here: ``prepare_build`` chooses
-    *cache_root* using ``FQBN.object_cache_key(..., build_opt_fingerprint=…)``, so different
-    ``build_opt.h`` **bytes** already live under different ``<temp>/acmake_objcache/<32 hex>/``
-    subtrees (same bytes → same key, including across sketch ``build/`` paths). This
-    function only reconciles platform-header drift and per-library source digests within
-    that subtree.
+    **``build_opt.h``** and the **platform SDK config** do **not** trigger a global wipe
+    here: ``prepare_build`` chooses *cache_root* using
+    ``FQBN.object_cache_key(..., build_opt_fingerprint=…, sdk_fingerprint=…)``, so different
+    ``build_opt.h`` **bytes** or a regenerated SDK (``sdkconfig`` / ``flags`` — see
+    ``sdk_config_fingerprint``) already live under different
+    ``<temp>/acmake_objcache/<32 hex>/`` subtrees (same inputs → same key, including across
+    sketch ``build/`` paths). This function only reconciles platform-header drift and
+    per-library source digests within that subtree.
 
     **Per-library** stamps (``.acmake_hdr_fp`` under each ``lib/…`` bundle) combine the
     library input digest with ``_build_opt_fingerprint(build_dir)`` (``build_opt.h`` **bytes**

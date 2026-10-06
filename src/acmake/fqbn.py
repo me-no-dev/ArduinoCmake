@@ -49,6 +49,7 @@ class FQBN:
         compiler_warnings: str | None = None,
         build_property_tag: str | None = None,
         build_opt_fingerprint: str | None = None,
+        sdk_fingerprint: str | None = None,
     ) -> str:
         """Fixed-length dir under ``acmake_objcache/`` (FQBN + core package ``version``).
 
@@ -63,11 +64,21 @@ class FQBN:
         in so **different** ``build_opt.h``
         contents use **separate** core / variant / library cache subtrees (same bytes →
         same key, including across different sketch ``build/`` directories).
+
+        *sdk_fingerprint* is the SHA-256 hex digest of the platform SDK's config inputs
+        (``compiler.sdk.path``: the generated ``sdkconfig`` plus the ``flags/*`` define /
+        include files — see ``acmake.cache_invalidate.sdk_config_fingerprint``). The core
+        package ``version`` does **not** change when those libs are regenerated locally
+        (e.g. flipping a Kconfig symbol), yet the bytes baked onto every compile line do.
+        Folding the digest in gives each SDK config its own core / variant / library cache
+        subtree, so cached ``.o`` files built against a different ``sdkconfig`` are never
+        reused. Empty on toolchains without an SDK path, leaving the key unchanged.
         """
         cv = (core_version or "").strip()
         w = (compiler_warnings or "").strip().lower()
         t = (build_property_tag or "").strip()
         bo = (build_opt_fingerprint or "").strip()
+        sdk = (sdk_fingerprint or "").strip()
         parts = [self.to_string(), cv]
         if w:
             parts.append(f"warnings={w}")
@@ -75,6 +86,8 @@ class FQBN:
             parts.append(f"props={t}")
         if bo:
             parts.append(f"build_opt={bo}")
+        if sdk:
+            parts.append(f"sdk={sdk}")
         blob = "\0".join(parts)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 

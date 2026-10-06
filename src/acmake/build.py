@@ -17,6 +17,7 @@ from acmake.cache_invalidate import (
     _build_opt_fingerprint,
     core_version_for_cache,
     maybe_refresh_object_cache,
+    sdk_config_fingerprint,
 )
 from acmake.config import ArduinoPaths
 from acmake.discovery import resolve_all_runtime_tools, resolve_platform_root
@@ -113,8 +114,15 @@ def _object_cache_root_for_fqbn(
     build_property_tag: str | None = None,
     *,
     build_dir: Path | None = None,
+    sdk_fingerprint: str | None = None,
 ) -> Path:
-    """Shared cache root for FQBN + core version + ``build_opt.h`` content (+ optional warnings / props)."""
+    """Shared cache root for FQBN + core version + ``build_opt.h`` content + SDK config (+ optional warnings / props).
+
+    *sdk_fingerprint* (see ``sdk_config_fingerprint``) scopes the tree to the platform
+    SDK's ``sdkconfig`` / ``flags`` so a regenerated SDK with different Kconfig never
+    reuses ``.o`` files built against the old config, even when the core version is
+    unchanged.
+    """
     bo_fp: str | None = None
     if build_dir is not None:
         bo_fp = _build_opt_fingerprint(build_dir)
@@ -123,6 +131,7 @@ def _object_cache_root_for_fqbn(
         compiler_warnings=compiler_warnings,
         build_property_tag=build_property_tag,
         build_opt_fingerprint=bo_fp,
+        sdk_fingerprint=sdk_fingerprint,
     )
 
 
@@ -409,8 +418,14 @@ def prepare_build(
     if _object_cache_enabled(use_object_cache):
         core_ver = core_version_for_cache(expanded, platform_root)
         prop_tag = _build_properties_cache_tag(build_properties)
+        sdk_fp = sdk_config_fingerprint(expanded)
         cache_root = _object_cache_root_for_fqbn(
-            fqbn, core_ver, warn_for_cache, prop_tag, build_dir=build_dir
+            fqbn,
+            core_ver,
+            warn_for_cache,
+            prop_tag,
+            build_dir=build_dir,
+            sdk_fingerprint=sdk_fp,
         )
         object_cache_dir = cache_root
         cache_root.mkdir(parents=True, exist_ok=True)
