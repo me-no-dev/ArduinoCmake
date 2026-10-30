@@ -14,7 +14,12 @@ from acmake.build import collect_gcov_notes, prepare_build
 from acmake.properties import parse_build_property
 from acmake.cache_invalidate import clear_entire_object_cache
 from acmake.cmakegen import write_cmake
-from acmake.hooks import PRE_NINJA_HOOK_PHASES, post_ninja_hook_phases, run_hook_phases
+from acmake.hooks import (
+    BUILD_STAGE_HOOKS,
+    POST_BUILD_HOOK_PHASES,
+    has_build_stage_hooks,
+    run_hook_phases,
+)
 from acmake.config import ArduinoPaths
 from acmake.fqbn import FQBN
 from acmake.logging_util import setup_logging
@@ -58,24 +63,78 @@ def should_run_cmake_configure(build_dir: Path) -> bool:
     return not (bpath / "CMakeCache.txt").is_file() or not (bpath / "build.ninja").is_file()
 
 
-def _run_cmake(build_dir: Path, verbose: bool) -> None:
-    """Run initial configure only once; otherwise rely on ``cmake --build`` / Ninja."""
+def _cmake_configure_if_needed(build_dir: Path, verbose: bool) -> None:
+    """Run the initial ``cmake -S … -B …`` configure for an unconfigured tree."""
+    bd = str(build_dir.resolve())
+    if not should_run_cmake_configure(Path(bd)):
+        return
+    cmake = shutil.which("cmake")
+    if not cmake:
+        raise FileNotFoundError("cmake not found on PATH")
+    cmd = [cmake, "-S", bd, "-B", bd, "-G", "Ninja"]
+    if verbose:
+        print(" ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def _cmake_build(build_dir: Path, verbose: bool, *, target: str | None = None) -> None:
+    """Run ``cmake --build`` (optionally one milestone target)."""
     bd = str(build_dir.resolve())
     cmake = shutil.which("cmake")
     if not cmake:
         raise FileNotFoundError("cmake not found on PATH")
-    bpath = Path(bd)
-
-    if should_run_cmake_configure(bpath):
-        cmd = [cmake, "-S", bd, "-B", bd, "-G", "Ninja"]
-        if verbose:
-            print(" ".join(cmd))
-        subprocess.run(cmd, check=True)
-
     cmd2 = [cmake, "--build", bd]
+    if target:
+        cmd2.extend(["--target", target])
     if verbose:
         print(" ".join(cmd2))
     subprocess.run(cmd2, check=True)
+
+
+def _run_cmake(build_dir: Path, verbose: bool) -> None:
+    """Run initial configure only once; otherwise rely on ``cmake --build`` / Ninja."""
+    _cmake_configure_if_needed(build_dir, verbose)
+    _cmake_build(build_dir, verbose)
+
+
+def _run_build_with_hooks(plan, verbose: bool) -> None:
+    """Build, placing build-stage hooks at their exact Arduino boundaries.
+
+    With no sketch/libraries/core/linking hooks, keep the fast single-invocation
+    build (all phases in parallel). Otherwise run one milestone target per phase in
+    Arduino order (sketch → libraries → core → link → objcopy) and run the matching
+    ``recipe.hooks.*`` before/after each one.
+    """
+    if not has_build_stage_hooks(plan.expanded):
+        _run_cmake(plan.build_dir, verbose)
+        return
+    _cmake_configure_if_needed(plan.build_dir, verbose)
+    for pre, target, post in BUILD_STAGE_HOOKS:
+        run_hook_phases(plan.expanded, plan.build_dir, (pre,), verbose=verbose)
+        _cmake_build(plan.build_dir, verbose, target=target)
+        run_hook_phases(plan.expanded, plan.build_dir, (post,), verbose=verbose)
+    _cmake_build(plan.build_dir, verbose, target="acmake_objcopy")
+
+
+def export_binaries(plan, export_dir: Path, *, verbose: bool = False) -> None:
+    """Export build artifacts to *export_dir*, bracketed by ``recipe.hooks.savehex.*``.
+
+    Matches ``arduino-cli --export-binaries``: ``presavehex`` runs first, every
+    non-directory file in the build dir whose name starts with ``build.project_name``
+    is copied, then ``postsavehex`` runs. ``presavehex`` may itself write artifacts
+    (e.g. ``.lst`` / ``.map``) into the build dir; those are copied too.
+    """
+    run_hook_phases(plan.expanded, plan.build_dir, ("savehex.presavehex",), verbose=verbose)
+    base = plan.expanded.get("build.project_name", "")
+    target = export_dir.expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    if target != plan.build_dir.resolve():
+        for p in sorted(plan.build_dir.iterdir()):
+            if p.is_file() and p.name.startswith(base):
+                shutil.copy2(p, target / p.name)
+    run_hook_phases(
+        plan.expanded, plan.build_dir, ("savehex.postsavehex",), verbose=verbose
+    )
 
 
 def cmd_compile(args: argparse.Namespace) -> int:
@@ -124,24 +183,24 @@ def cmd_compile(args: argparse.Namespace) -> int:
     if plan.object_cache_dir is not None and args.verbose >= 1:
         log.info("object cache: %s", plan.object_cache_dir)
     write_cmake(plan)
-    run_hook_phases(
-        plan.expanded,
-        plan.build_dir,
-        PRE_NINJA_HOOK_PHASES,
-        verbose=args.verbose >= 2,
-    )
-    _run_cmake(out, args.verbose >= 1)
+    _run_build_with_hooks(plan, args.verbose >= 1)
     collect_gcov_notes(plan)
-    if args.export_binaries:
-        log.info("export-binaries: running recipe.hooks.savehex.*")
     run_hook_phases(
         plan.expanded,
         plan.build_dir,
-        post_ninja_hook_phases(
-            plan.expanded, export_binaries=args.export_binaries
-        ),
+        POST_BUILD_HOOK_PHASES,
         verbose=args.verbose >= 2,
     )
+    export_dir: Path | None = None
+    if getattr(args, "export_dir", None):
+        export_dir = Path(args.export_dir).expanduser().resolve()
+    elif args.export_binaries:
+        export_dir = (
+            sketch / "build" / f"{fqbn.vendor}.{fqbn.arch}.{fqbn.board_id}"
+        ).resolve()
+    if export_dir is not None:
+        log.info("export-binaries: running recipe.hooks.savehex.* -> %s", export_dir)
+        export_binaries(plan, export_dir, verbose=args.verbose >= 2)
     fits = print_size_report(plan)
     print_library_report(plan)
     if not fits:
@@ -262,8 +321,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--export-binaries",
         action="store_true",
         help=(
-            "After a successful build, run recipe.hooks.savehex.presavehex / "
-            "recipe.hooks.savehex.postsavehex (export binaries; same idea as arduino-cli --export-binaries)"
+            "After a successful build, copy the built artifacts (files named after "
+            "build.project_name) to <sketch>/build/<vendor>.<arch>.<board>, bracketed by "
+            "recipe.hooks.savehex.presavehex / postsavehex (same idea as arduino-cli --export-binaries)"
+        ),
+    )
+    c.add_argument(
+        "--export-dir",
+        dest="export_dir",
+        metavar="DIR",
+        help=(
+            "Export built artifacts to DIR (implies --export-binaries; "
+            "same as arduino-cli --export-dir)"
         ),
     )
     c.add_argument(

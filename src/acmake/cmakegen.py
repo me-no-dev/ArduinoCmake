@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
 import acmake.cache_compile as _cache_compile_mod
+from acmake.cache_compile import should_skip_cached_compile
 
 from acmake.build import (
     BuildPlan,
@@ -435,21 +437,53 @@ def _mtime_skip_cache_compile(plan: BuildPlan, so) -> bool:
     )
 
 
-def _strip_sketch_build_deps_for_shared_lib(
+def _ccache_enabled() -> bool:
+    """True when ``ccache`` is on PATH and ``ACMAKE_CCACHE`` is not a disable token."""
+    v = os.environ.get("ACMAKE_CCACHE", "1").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    return shutil.which("ccache") is not None
+
+
+def _prefix_ccache(argv: list[str]) -> list[str]:
+    """Prefix *argv* with ``ccache`` so custom compile commands go through the compiler cache.
+
+    Arduino recipes are ``add_custom_command``s, not CMake ``C/CXX`` language compiles, so
+    ``CMAKE_C_COMPILER_LAUNCHER`` does not apply. Sketch, core, variant, and library TUs
+    all take this path. No-op when ccache is missing, disabled, or already the first token.
+
+    Do not set ``CCACHE_BASEDIR`` to the source tree when Ninja's working
+    directory is outside it (ACmake uses the sketch ``build_dir``). ccache then
+    rewrites ``-iprefix`` / ``@flags/includes`` relative to that CWD and
+    ``__has_include`` can fail, leaving library TUs like ``PPP.cpp`` empty.
+    """
+    if not argv or not _ccache_enabled():
+        return list(argv)
+    head = Path(argv[0]).name.lower()
+    if head in ("ccache", "ccache.exe"):
+        return list(argv)
+    ccache = shutil.which("ccache")
+    if not ccache:
+        return list(argv)
+    return [ccache, *argv]
+
+
+def _strip_sketch_build_deps_for_shared_cache(
     plan: BuildPlan, so, rsp_deps: list[str]
 ) -> list[str]:
-    """Drop paths under *plan.build_dir* from Ninja ``DEPENDS`` for cached library objects.
+    """Drop paths under *plan.build_dir* from Ninja ``DEPENDS`` for cached TUs.
 
     Cached ``.o`` files live under the FQBN object cache and are shared across sketches.
     Response files under the sketch ``build_dir`` (e.g. ``build_opt.h``, ``file_opts``)
     become per-sketch absolute paths in ``DEPENDS``. A **new** example’s copies then look
-    like new inputs to Ninja, so every linked library TU is re-run even when
-    ``maybe_refresh_object_cache`` sees unchanged ``build_opt`` bytes and library headers.
+    like new inputs to Ninja, so every linked core / variant / library TU is re-run even
+    when ``maybe_refresh_object_cache`` sees unchanged ``build_opt`` bytes and headers.
 
-    Library sources must not depend on sketch-owned paths for correctness beyond those
-    stubs; real ``build_opt`` / header changes are handled by cache invalidation.
+    Shared-cache sources must not depend on sketch-owned paths for correctness beyond
+    those stubs; real ``build_opt`` / header changes are handled by cache invalidation
+    (content-keyed subtree + stamps). Sketch TUs keep the full DEPENDS list.
     """
-    if plan.object_cache_dir is None or so.kind != "lib":
+    if plan.object_cache_dir is None or so.kind not in ("core", "variant", "lib"):
         return rsp_deps
     bd = plan.build_dir.resolve()
     out: list[str] = []
@@ -462,6 +496,13 @@ def _strip_sketch_build_deps_for_shared_lib(
             out.append(s)
             continue
     return out
+
+
+def _strip_sketch_build_deps_for_shared_lib(
+    plan: BuildPlan, so, rsp_deps: list[str]
+) -> list[str]:
+    """Alias for :func:`_strip_sketch_build_deps_for_shared_cache` (core/variant/lib)."""
+    return _strip_sketch_build_deps_for_shared_cache(plan, so, rsp_deps)
 
 
 def _emit_depfile(dep_path: Path, argv: list[str]) -> bool:
@@ -498,19 +539,28 @@ def write_cmake(plan: BuildPlan, cmake_lists_path: Path | None = None) -> Path:
         cmd = _recipe_for_source(plan, so)
         if not cmd.strip():
             continue
+        mtime_cache = _mtime_skip_cache_compile(plan, so)
+        # Fresh shared-cache objects are still link/archive inputs; do not give
+        # Ninja a custom command that would only spawn cache_compile.py to no-op.
+        if mtime_cache and should_skip_cached_compile(so.object_path, so.source):
+            lines.append(
+                f"# compile {so.kind}: {so.source.name} (objcache fresh; no Ninja rule)"
+            )
+            lines.append("")
+            continue
         argv = split_recipe(cmd)
         if not argv:
             continue
         argv, stub_deps = resolve_build_dir_at_file_argv(bd, argv)
-        mtime_cache = _mtime_skip_cache_compile(plan, so)
         argv = _argv_set_depfile_mf(
             argv, so.dep_path, mf_relative_to=bd if mtime_cache else None
         )
         rsp_deps = stub_deps + collect_at_file_dep_paths(argv)
-        rsp_deps = _strip_sketch_build_deps_for_shared_lib(plan, so, rsp_deps)
+        rsp_deps = _strip_sketch_build_deps_for_shared_cache(plan, so, rsp_deps)
         rsp_deps_sorted = sorted(dict.fromkeys(rsp_deps), key=lambda p: str(p).replace("\\", "/"))
         if so.kind == "core":
             argv.insert(1, "-DARDUINO_CORE_BUILD")
+        argv = _prefix_ccache(argv)
         dep_rel = os.path.relpath(so.dep_path, bd).replace("\\", "/")
         if mtime_cache:
             argv = [
@@ -575,7 +625,10 @@ def write_cmake(plan: BuildPlan, cmake_lists_path: Path | None = None) -> Path:
             f"{recipe_keys[:40]!r}{'…' if len(recipe_keys) > 40 else ''}"
         )
     link_argv = split_recipe(link_cmd)
-    link_argv, link_stub = resolve_build_dir_at_file_argv(bd, link_argv)
+    # Link-time response files (e.g. ESP32 ``link_libs.rsp`` refreshed by
+    # ``recipe.hooks.linking.prelink``) must be read by the linker, not frozen into the
+    # generated argv when CMakeLists.txt is written.
+    link_argv, link_stub = resolve_build_dir_at_file_argv(bd, link_argv, inline=False)
     link_rsp = link_stub + collect_at_file_dep_paths(link_argv)
     elf_path = plan.elf_path
     assert elf_path is not None
@@ -624,7 +677,7 @@ def write_cmake(plan: BuildPlan, cmake_lists_path: Path | None = None) -> Path:
         if not argv:
             continue
         stem = stem_from_objcopy_recipe_key(recipe_key)
-        argv, stub = resolve_build_dir_at_file_argv(bd, argv)
+        argv, stub = resolve_build_dir_at_file_argv(bd, argv, inline=False)
         rsp = stub + collect_at_file_dep_paths(argv)
         recipe_out = infer_objcopy_output_path(plan, stem, argv)
         recipe_out_r = recipe_out.resolve()
@@ -686,12 +739,46 @@ def write_cmake(plan: BuildPlan, cmake_lists_path: Path | None = None) -> Path:
 
     if post_stamp_path is not None:
         final = [_q(post_stamp_path)]
+        final_paths = [post_stamp_path]
     elif objcopy_outputs:
         final = objcopy_outputs
+        final_paths = list(objcopy_out_paths)
     elif pre_stamp_path is not None:
         final = [_q(pre_stamp_path)]
+        final_paths = [pre_stamp_path]
     else:
         final = [_q(elf_path)]
+        final_paths = [elf_path]
+
+    # Per-stage milestone targets consumed by the CLI when build-stage hooks exist,
+    # so ``recipe.hooks.sketch|libraries|core|linking.*`` run at their exact boundary
+    # (see ``acmake.hooks.BUILD_STAGE_HOOKS``).
+    sketch_objs = [so.object_path for so in plan.sources if so.kind == "sketch"]
+    library_objs = [so.object_path for so in plan.sources if so.kind == "lib"]
+    core_objs_all = [
+        so.object_path for so in plan.sources if so.kind in ("core", "variant")
+    ]
+    core_stage: list[Path] = list(core_objs_all)
+    if archive_path and core_objs:
+        core_stage.append(archive_path)
+
+    def _emit_milestone(name: str, deps: list[Path]) -> None:
+        uniq = list(dict.fromkeys(deps))
+        if uniq:
+            lines.append(
+                f"add_custom_target({name} DEPENDS "
+                + " ".join(_q(p) for p in uniq)
+                + ")"
+            )
+        else:
+            lines.append(f"add_custom_target({name})")
+        lines.append("")
+
+    _emit_milestone("acmake_sketch_objects", sketch_objs)
+    _emit_milestone("acmake_libraries_objects", library_objs)
+    _emit_milestone("acmake_core_objects", core_stage)
+    _emit_milestone("acmake_link", [elf_path])
+    _emit_milestone("acmake_objcopy", final_paths)
 
     lines.append(
         "add_custom_target(acmake_sketch ALL DEPENDS " + " ".join(final) + ")"

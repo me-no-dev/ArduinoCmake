@@ -17,30 +17,34 @@ logger = logging.getLogger(__name__)
 # Run after ``prepare_build`` path expansion, before sketch preprocessing / library discovery.
 PRE_SKETCH_HOOK_PHASES: tuple[str, ...] = ("prebuild",)
 
-# Run after CMakeLists is written, immediately before ``cmake --build``.
-PRE_NINJA_HOOK_PHASES: tuple[str, ...] = (
-    "sketch.prebuild",
-    "libraries.prebuild",
-    "core.prebuild",
-    "linking.prelink",
+# Build-stage hooks, in Arduino build order. Each row is
+# ``(pre-build phase, CMake target for the stage, post-build phase)``.
+#
+# :func:`acmake.cmakegen.write_cmake` emits one milestone target per build stage
+# (``acmake_sketch_objects``, ``acmake_libraries_objects``, ``acmake_core_objects``,
+# ``acmake_link``), and :func:`acmake.cli.cmd_compile` runs the per-stage hooks around
+# the matching ``cmake --build --target`` call. This keeps every hook at its exact
+# boundary (sketch → libraries → core → link) instead of batching all "pre" hooks
+# before the whole build and all "post" hooks after it.
+BUILD_STAGE_HOOKS: tuple[tuple[str, str, str], ...] = (
+    ("sketch.prebuild", "acmake_sketch_objects", "sketch.postbuild"),
+    ("libraries.prebuild", "acmake_libraries_objects", "libraries.postbuild"),
+    ("core.prebuild", "acmake_core_objects", "core.postbuild"),
+    ("linking.prelink", "acmake_link", "linking.postlink"),
 )
 
-# Run after a successful ``cmake --build``.
 # ``recipe.hooks.objcopy.*`` are **not** listed here: they are emitted into CMake/Ninja by
-# :func:`acmake.cmakegen.write_cmake` so ``preobjcopy`` runs after link and before
-# ``recipe.objcopy.*``, and ``postobjcopy`` runs after all ``recipe.objcopy.*`` outputs.
-POST_NINJA_HOOK_PHASES_HEAD: tuple[str, ...] = (
-    "linking.postlink",
-    "sketch.postbuild",
-    "libraries.postbuild",
-    "core.postbuild",
-)
-# ``recipe.hooks.savehex.*`` — run only when exporting binaries (see :func:`post_ninja_hook_phases`).
-POST_NINJA_HOOK_PHASES_SAVEHEX: tuple[str, ...] = (
+# :func:`acmake.cmakegen.write_cmake` so ``preobjcopy`` runs after link (and after
+# ``recipe.hooks.linking.postlink``) and before ``recipe.objcopy.*``, and ``postobjcopy``
+# runs after all ``recipe.objcopy.*`` outputs.
+#
+# ``recipe.hooks.savehex.*`` bracket the export of built artifacts to the sketch
+# directory and are run by :func:`acmake.cli.export_binaries`.
+POST_BUILD_HOOK_PHASES: tuple[str, ...] = ("postbuild",)
+SAVEHEX_HOOK_PHASES: tuple[str, ...] = (
     "savehex.presavehex",
     "savehex.postsavehex",
 )
-POST_NINJA_HOOK_PHASES_TAIL: tuple[str, ...] = ("postbuild",)
 
 HOOK_PHASE_PREFIXES: dict[str, str] = {
     "prebuild": "recipe.hooks.prebuild.",
@@ -105,22 +109,17 @@ def ordered_objcopy_hook_phases(expanded: dict[str, str]) -> tuple[str, ...]:
     return tuple(out)
 
 
-def post_ninja_hook_phases(
-    expanded: dict[str, str],
-    *,
-    export_binaries: bool = False,
-) -> tuple[str, ...]:
-    """Post-``cmake --build`` hooks (excluding ``recipe.hooks.objcopy``, embedded in Ninja).
+def has_build_stage_hooks(expanded: dict[str, str]) -> bool:
+    """True when any sketch/libraries/core/linking hook needs a staged build.
 
-    When *export_binaries* is true, ``recipe.hooks.savehex.presavehex`` /
-    ``recipe.hooks.savehex.postsavehex`` are included (Arduino ``--export-binaries`` style).
+    Without such hooks the CLI keeps the fast single-invocation ``cmake --build``
+    (all phases in parallel); with them it builds one milestone target per phase so
+    the hooks land at the exact Arduino boundaries.
     """
-    _ = expanded
-    out: list[str] = list(POST_NINJA_HOOK_PHASES_HEAD)
-    if export_binaries:
-        out.extend(POST_NINJA_HOOK_PHASES_SAVEHEX)
-    out.extend(POST_NINJA_HOOK_PHASES_TAIL)
-    return tuple(out)
+    for pre, _target, post in BUILD_STAGE_HOOKS:
+        if collect_hook_commands(expanded, pre) or collect_hook_commands(expanded, post):
+            return True
+    return False
 
 
 def objcopy_pre_recipe_hook_phases(expanded: dict[str, str]) -> tuple[str, ...]:

@@ -7,12 +7,16 @@ from pathlib import Path
 import pytest
 
 from acmake.hooks import (
+    BUILD_STAGE_HOOKS,
+    POST_BUILD_HOOK_PHASES,
+    SAVEHEX_HOOK_PHASES,
     collect_hook_commands,
     collect_ordered_hook_shell_commands,
+    has_build_stage_hooks,
+    hook_prefix_for_phase,
     objcopy_post_recipe_hook_phases,
     objcopy_pre_recipe_hook_phases,
     ordered_objcopy_hook_phases,
-    post_ninja_hook_phases,
     run_hook_phases,
 )
 
@@ -62,29 +66,52 @@ def test_collect_hook_commands_dynamic_objcopy_subphase() -> None:
     assert [c[1] for c in cmds] == ["first", "second"]
 
 
-def test_post_ninja_phases_exclude_objcopy_hooks_embedded_in_ninja() -> None:
-    expanded = {
-        "recipe.hooks.objcopy.postobjcopy.1.pattern": "true",
-        "recipe.hooks.savehex.presavehex.1.pattern": "true",
-    }
-    phases = post_ninja_hook_phases(expanded)
-    assert "objcopy.postobjcopy" not in phases
-    assert "savehex.presavehex" not in phases
+ALL_SPEC_HOOK_PHASES = (
+    "prebuild",
+    "sketch.prebuild",
+    "sketch.postbuild",
+    "libraries.prebuild",
+    "libraries.postbuild",
+    "core.prebuild",
+    "core.postbuild",
+    "linking.prelink",
+    "linking.postlink",
+    "objcopy.preobjcopy",
+    "objcopy.postobjcopy",
+    "savehex.presavehex",
+    "savehex.postsavehex",
+)
 
 
-def test_post_ninja_export_includes_savehex_hooks() -> None:
-    expanded = {"recipe.hooks.savehex.presavehex.1.pattern": "true"}
-    phases = post_ninja_hook_phases(expanded, export_binaries=True)
-    assert "savehex.presavehex" in phases
-    assert "savehex.postsavehex" in phases
-    assert phases.index("savehex.presavehex") > phases.index("core.postbuild")
-    assert phases.index("postbuild") > phases.index("savehex.postsavehex")
+def test_every_platform_spec_hook_phase_is_recognized() -> None:
+    for phase in ALL_SPEC_HOOK_PHASES:
+        prefix = hook_prefix_for_phase(phase)
+        assert prefix is not None, phase
+        assert prefix == f"recipe.hooks.{phase}.", phase
+        key = f"{prefix}1.pattern"
+        assert [c[1] for c in collect_hook_commands({key: "true"}, phase)] == ["true"]
 
 
-def test_post_ninja_savehex_after_link_post_when_export() -> None:
-    expanded = {"recipe.hooks.savehex.presavehex.1.pattern": "true"}
-    phases = post_ninja_hook_phases(expanded, export_binaries=True)
-    assert phases.index("savehex.presavehex") > phases.index("linking.postlink")
+def test_has_build_stage_hooks_detects_each_stage() -> None:
+    assert not has_build_stage_hooks({})
+    assert not has_build_stage_hooks({"recipe.hooks.prebuild.1.pattern": "true"})
+    for pre, _target, post in BUILD_STAGE_HOOKS:
+        assert has_build_stage_hooks({f"recipe.hooks.{pre}.1.pattern": "true"})
+        assert has_build_stage_hooks({f"recipe.hooks.{post}.1.pattern": "true"})
+
+
+def test_build_stage_order_matches_arduino() -> None:
+    assert BUILD_STAGE_HOOKS == (
+        ("sketch.prebuild", "acmake_sketch_objects", "sketch.postbuild"),
+        ("libraries.prebuild", "acmake_libraries_objects", "libraries.postbuild"),
+        ("core.prebuild", "acmake_core_objects", "core.postbuild"),
+        ("linking.prelink", "acmake_link", "linking.postlink"),
+    )
+
+
+def test_post_and_savehex_phases_separate() -> None:
+    assert POST_BUILD_HOOK_PHASES == ("postbuild",)
+    assert SAVEHEX_HOOK_PHASES == ("savehex.presavehex", "savehex.postsavehex")
 
 
 def test_run_hook_phases_prebuild(tmp_path: Path) -> None:

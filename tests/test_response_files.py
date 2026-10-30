@@ -20,8 +20,7 @@ def test_read_rsp_quoted_include_paths_use_posix_split(tmp_path: Path) -> None:
     """ESP32 ``@flags/includes`` lines use POSIX quotes; Windows ``shlex`` must not use ``posix=False``."""
     f = tmp_path / "includes.rsp"
     f.write_text(
-        '-I"C:/hardware/esp32/variants/esp32" '
-        '-I"C:/hardware/esp32/cores/esp32"\n',
+        '-I"C:/hardware/esp32/variants/esp32" -I"C:/hardware/esp32/cores/esp32"\n',
         encoding="utf-8",
     )
     assert read_gcc_response_file_tokens(f) == [
@@ -43,9 +42,7 @@ def test_resolve_build_dir_drops_empty_file_opts(tmp_path: Path) -> None:
     bd.mkdir()
     fo = bd / "file_opts"
     fo.write_bytes(b"")
-    argv, deps = resolve_build_dir_at_file_argv(
-        bd, ["g++", f"@{fo}", "-c", "a.cpp"]
-    )
+    argv, deps = resolve_build_dir_at_file_argv(bd, ["g++", f"@{fo}", "-c", "a.cpp"])
     assert "@" not in "".join(argv)
     assert str(fo.resolve()) in deps
 
@@ -68,6 +65,27 @@ def test_collect_at_file_dep_paths_keeps_argv_shape(tmp_path: Path) -> None:
     deps = collect_at_file_dep_paths(argv)
     assert argv == ["gcc", f"@{rsp}", "-c", "a.c"]
     assert Path(deps[0]).resolve() == rsp.resolve()
+
+
+def test_resolve_build_dir_keeps_missing_generated_rsp(tmp_path: Path) -> None:
+    """A prelink-generated ``link_libs.rsp`` must not be dropped at CMake-generation time."""
+    bd = tmp_path / "build"
+    bd.mkdir()
+    rsp = bd / "link_libs.rsp"
+    argv, deps = resolve_build_dir_at_file_argv(bd, ["g++", f"@{rsp}", "-o", "a.elf"])
+    assert argv == ["g++", f"@{rsp}", "-o", "a.elf"]
+    assert deps == []
+
+
+def test_resolve_build_dir_inline_false_keeps_existing_rsp(tmp_path: Path) -> None:
+    """Link/objcopy must read build-dir response files at execution time (not stale copies)."""
+    bd = tmp_path / "build"
+    bd.mkdir()
+    rsp = bd / "link_libs.rsp"
+    rsp.write_text("-lbt.matter\n", encoding="utf-8")
+    argv, deps = resolve_build_dir_at_file_argv(bd, ["g++", f"@{rsp}"], inline=False)
+    assert argv == ["g++", f"@{rsp}"]
+    assert str(rsp.resolve()) in deps
 
 
 def test_argv_text_for_depfile_peeks_rsp(tmp_path: Path) -> None:
@@ -150,4 +168,3 @@ def test_ensure_stubs_clears_stale_build_opt_when_sketch_has_none(
     ensure_build_response_stubs(b, s_without)
     t2 = opt.stat().st_mtime_ns
     assert t1 == t2
-

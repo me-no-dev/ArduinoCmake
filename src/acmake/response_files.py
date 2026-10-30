@@ -43,7 +43,7 @@ def read_gcc_response_file_tokens(rsp: Path) -> list[str]:
 
 
 def resolve_build_dir_at_file_argv(
-    build_dir: Path, argv: list[str]
+    build_dir: Path, argv: list[str], *, inline: bool = True
 ) -> tuple[list[str], list[str]]:
     """Rewrite ``@path`` when *path* is under *build_dir* (acmake output).
 
@@ -53,6 +53,15 @@ def resolve_build_dir_at_file_argv(
     *build_dir* are inlined as argv tokens.
 
     ``@`` paths outside *build_dir* are left unchanged.
+
+    With ``inline=False``, ``@`` paths under *build_dir* are left as ``@path`` so the
+    tool reads them **at execution time**. Use this for link/objcopy commands: response
+    files created or refreshed by ``recipe.hooks.linking.prelink`` (e.g. ESP32
+    ``link_libs.rsp``) do not exist when CMakeLists.txt is written, and inlining an
+    older copy would freeze stale contents into the link line.
+
+    Missing ``@`` files are always preserved, never silently dropped: a later build
+    step (a hook, or the tool itself) may create them.
 
     Returns ``(new_argv, extra_dep_paths)`` for paths consumed from under *build_dir*.
     """
@@ -78,9 +87,14 @@ def resolve_build_dir_at_file_argv(
             continue
 
         if not p.is_file():
+            # Generated later (e.g. prelink response file): keep ``@path`` intact.
+            out.append(a)
             continue
 
         extra_deps.append(str(rp))
+        if not inline:
+            out.append(a)
+            continue
         toks = read_gcc_response_file_tokens(p)
         if not toks:
             # Empty ``build_opt.h`` is valid (Arduino build flags); still force ``-include``.

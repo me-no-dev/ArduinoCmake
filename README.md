@@ -58,7 +58,8 @@ Generate CMake in the build directory, run CMake + Ninja, run optional post-buil
 | `--ide-version` | no | Value for `runtime.ide.version` style defines (default: `10607`). |
 | `--clean` | no | Delete the build directory before configuring. |
 | `--no-preprocessor` | no | Skip `arduino-preprocessor`; concatenates `.ino` files only (may break link if the sketch needs prototypes). |
-| `--export-binaries` | no | After a successful build, run `recipe.hooks.savehex.presavehex` / `postsavehex` (same idea as `arduino-cli --export-binaries`). |
+| `--export-binaries` | no | After a successful build, copy the built artifacts (files named after `build.project_name`) to `<sketch>/build/<vendor>.<arch>.<board>`, bracketed by `recipe.hooks.savehex.presavehex` / `postsavehex` (same idea as `arduino-cli --export-binaries`). |
+| `--export-dir DIR` | no | Export built artifacts to `DIR` (implies `--export-binaries`; same as `arduino-cli --export-dir`). |
 | `--no-object-cache` | no | Keep all `.o` files and `core.a` under the sketch build dir instead of the shared temp cache (see below). |
 | `--warnings LEVEL` | no | One of `none`, `default`, `more`, `all`: sets ``compiler.warning_flags`` from ``compiler.warning_flags.<LEVEL>`` in ``platform.txt`` (same as arduino-cli ``--warnings``). With the shared object cache on, this selects a separate cache subtree so flags stay consistent. |
 | `--build-property KEY=VALUE` | no | Override a merged platform/board property (repeatable; same as arduino-cli ``--build-property``). First ``=`` separates key from value, so values may contain ``=``. Changes the object-cache bucket when the shared cache is on. |
@@ -78,6 +79,30 @@ acmake compile --fqbn espressif:esp32:esp32s3 --sketch /path/to/Sketch \
   --build-property 'compiler.warning_flags.all=-Wall -Werror=all -Wextra'
 ```
 
+### Platform hooks (`recipe.hooks.*`)
+
+All Arduino platform-spec hook phases are supported and run at their documented boundaries:
+
+| Phase | Runs |
+|-------|------|
+| `recipe.hooks.prebuild` | before sketch preprocessing and library discovery |
+| `recipe.hooks.sketch.prebuild` | immediately before sketch compilation |
+| `recipe.hooks.sketch.postbuild` | immediately after sketch compilation |
+| `recipe.hooks.libraries.prebuild` | immediately before library compilation |
+| `recipe.hooks.libraries.postbuild` | immediately after library compilation |
+| `recipe.hooks.core.prebuild` | immediately before core/variant compilation |
+| `recipe.hooks.core.postbuild` | immediately after core/variant compilation (`core.a` built) |
+| `recipe.hooks.linking.prelink` | immediately before linking |
+| `recipe.hooks.linking.postlink` | immediately after linking |
+| `recipe.hooks.objcopy.preobjcopy` | after `linking.postlink`, before `recipe.objcopy.*` |
+| `recipe.hooks.objcopy.postobjcopy` | after all `recipe.objcopy.*` outputs |
+| `recipe.hooks.savehex.presavehex` | before exporting binaries (`--export-binaries` / `--export-dir`) |
+| `recipe.hooks.savehex.postsavehex` | after exporting binaries |
+
+Hook commands are expanded with the merged platform/board properties (plus runtime tool paths) and run from the build directory, in numeric `NUMBER` order, through the platform’s shell (`/bin/sh`, or `cmd`/`bash` on Windows). `{...}` placeholders are expanded before execution.
+
+Sketch, library, core, and linking hooks need exact ordering, so when any of them exist acmake builds one Ninja milestone target per stage (sketch → libraries → core → link → objcopy) and runs the matching hooks between stages. When none of those hooks are defined, acmake keeps the faster single-invocation parallel build. `objcopy` hooks are always embedded in the generated CMake/Ninja graph.
+
 ### Shared object cache (default on)
 
 Object files for **core**, **variant**, and **each linked library** are shared under the system temp directory. The cache directory name is **32 hex characters**: SHA-256 (first 32 hex chars) of ``FQBN.to_string()`` + a NUL + the board package **version** string from ``platform.txt`` / expanded properties (so different core package versions never share the same cache tree). The SHA-256 **hex digest of ``build_opt.h`` bytes** in the current sketch ``build/`` directory is also mixed in (same bytes → same subtree, including across different examples; different bytes → a separate subtree). When the platform defines ``compiler.sdk.path`` (e.g. the ESP32 core's ``esp32-arduino-libs``), a ``sdk=…`` digest of that SDK's config inputs — the generated ``sdkconfig`` plus the ``flags/*`` define / include files — is mixed in as well, so regenerating the SDK with a different Kconfig (which does **not** bump the core package version) gets its own subtree instead of reusing ``.o`` files compiled against the old ``sdkconfig``. If you pass ``--warnings <LEVEL>``, a ``warnings=<LEVEL>`` segment is mixed into that hash so cached objects are not reused across different warning levels. If you pass one or more ``--build-property`` flags, a digest of those strings is added as ``props=…`` for the same reason. The **per-sketch build dir** defaults to ``<sketch>/build`` (override with ``--build-path``).
@@ -91,7 +116,7 @@ Layout (sketch ``.o`` files stay under the sketch build dir):
 **Invalidation (before each compile):** fingerprints under ``<cache>/.acmake_stamps/`` track when to delete cached ``.o`` (Ninja then rebuilds).
 
 1. **Platform / global:** If **any header** under the core or variant trees changes, all cached **core**, **variant**, and **library** objects **for that 32-hex cache subtree** are removed (full wipe of those paths and ``core.a``). The fingerprint lives under ``<cache>/.acmake_stamps/platform_hdr_fp``. **``build_opt.h``** does not use this wipe: different ``build_opt.h`` **contents** select a **different** cache subtree (see the cache key paragraph above), so toggling flags does not destroy another subtree’s objects. ``build_opt.h`` is **not** scanned as a C header; it is **not** given default ``#pragma once`` or other boilerplate—only your sketch’s ``build_opt.h`` is copied when present, otherwise an **empty** file is created for recipes that ``-include`` it (build flags / defines only).
-2. **Per core ``.o``:** After invalidation, each core object is rebuilt when its **``.c`` / ``.cpp`` / …** is newer than the ``.o`` (see ``cache_compile.py``).
+2. **Per core ``.o``:** After invalidation, each core object is rebuilt when its **``.c`` / ``.cpp`` / …** is newer than the ``.o`` (see ``cache_compile.py``). If the cached ``.o`` is already not older than the source, CMake omits that compile custom command so Ninja does not spawn ``cache_compile.py``; the path is still a link / ``core.a`` input.
 3. **Per library subtree:** Each bundle’s ``.acmake_hdr_fp`` combines a digest of the library install path, ``library.properties`` bytes (version, ``depends=``, …), and **contents** of library ``*.h`` / ``*.cpp`` / … under that install (excluding ``examples/``, ``tests/``, etc.) with the **``build_opt.h`` content** digest for the **current** sketch ``build/`` copy. In normal use the cache subtree already matches that digest (see cache key); the stamp still catches odd cases (e.g. one cache path reused with different ``build_dir`` values). Mtime-only changes on library sources or on ``build_opt.h`` do **not** invalidate by themselves. Core / variant header drift is still (1).
 4. **Per library ``.o``:** Same mtime rule as (2) for the translation unit source.
 
@@ -100,9 +125,10 @@ Layout (sketch ``.o`` files stay under the sketch build dir):
 - **Clear everything:** ``acmake cache-clear`` removes the entire ``<temp>/acmake_objcache`` directory (all FQBNs / versions).
 - Disable cache for one build: ``acmake compile … --no-object-cache`` (``upload`` has the same flag).
 - Environment: ``ACMAKE_OBJECT_CACHE=0`` (``false``, ``no``, ``off`` also turn it off).
+- ``ccache``: if ``ccache`` is on ``PATH``, compile recipes are prefixed with it (Arduino custom commands, not ``CMAKE_C_COMPILER_LAUNCHER``). Disable with ``ACMAKE_CCACHE=0``.
 - ``-v`` logs the resolved cache path as ``object cache: …``.
 
-``build_opt.h`` is copied from the sketch only when bytes differ (so mtimes do not churn every run). ``sketch.cpp`` from the preprocessor is written only when output bytes differ. Library discovery and CMake dependency lists use deterministic ordering so ``CMakeLists.txt`` stays stable when nothing real changed. For shared-cached **library** compiles, paths under the sketch ``build_dir`` from recipe ``@…`` stubs (e.g. ``build_opt.h``) are omitted from Ninja ``DEPENDS`` so a brand-new example ``build/`` does not make Ninja re-run every linked library; the compiler argv still includes those files, and (1)–(3) still invalidate when they matter. Each cached library TU also gets its own ``-I`` list (core + variant + that library + others it pulls in via ``depends=`` or ``#include`` tokens among **already linked** libraries), not the whole sketch link set, so ``WiFi.cpp`` compiles the same across examples that add unrelated libraries. For those same rules, ``-MF`` points at a depfile path **relative to the sketch build dir** (not an absolute path under ``…/OtherSketch/build/``), so Ninja does not treat a new example directory as a different command for the same shared ``.o``. ESP32 also puts ``-I{build.source.path}`` in ``compiler.cpreprocessor.flags``; that flag is **removed** from cached core/variant/lib recipes only (sketch translation units keep it) so the rule text does not embed each example’s ``.ino`` directory path. ``cmake -S … -B …`` runs only until ``CMakeCache.txt`` and ``build.ninja`` exist; later builds use ``cmake --build`` only.
+``build_opt.h`` is copied from the sketch only when bytes differ (so mtimes do not churn every run). ``sketch.cpp`` from the preprocessor is written only when output bytes differ. Library discovery and CMake dependency lists use deterministic ordering so ``CMakeLists.txt`` stays stable when nothing real changed. For shared-cached **core, variant, and library** compiles, paths under the sketch ``build_dir`` from recipe ``@…`` stubs (e.g. ``build_opt.h``) are omitted from Ninja ``DEPENDS`` so a brand-new example ``build/`` does not make Ninja re-run those TUs; the compiler argv still includes those files, and (1)–(3) still invalidate when they matter. Sketch translation units keep the full DEPENDS list. Each cached library TU also gets its own ``-I`` list (core + variant + that library + others it pulls in via ``depends=`` or ``#include`` tokens among **already linked** libraries), not the whole sketch link set, so ``WiFi.cpp`` compiles the same across examples that add unrelated libraries. For those same rules, ``-MF`` points at a depfile path **relative to the sketch build dir** (not an absolute path under ``…/OtherSketch/build/``), so Ninja does not treat a new example directory as a different command for the same shared ``.o``. ESP32 also puts ``-I{build.source.path}`` in ``compiler.cpreprocessor.flags``; that flag is **removed** from cached core/variant/lib recipes only (sketch translation units keep it) so the rule text does not embed each example’s ``.ino`` directory path. ``cmake -S … -B …`` runs only until ``CMakeCache.txt`` and ``build.ninja`` exist; later builds use ``cmake --build`` only.
 
 ## `acmake cache-clear`
 

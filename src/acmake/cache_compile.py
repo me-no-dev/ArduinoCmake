@@ -29,6 +29,21 @@ def _mtime_ns(path: Path) -> int:
     return int(st.st_mtime * 1_000_000_000)
 
 
+def should_skip_cached_compile(obj: Path, src: Path) -> bool:
+    """True when *obj* exists and is not older than *src*.
+
+    Same rule Ninja uses to omit a compile custom command, and the same check
+    ``main`` uses before invoking the compiler. Missing files, unequal paths,
+    or stat errors must compile (or fail) rather than treat the object as fresh.
+    """
+    try:
+        if not obj.is_file() or not src.is_file():
+            return False
+        return _mtime_ns(src) <= _mtime_ns(obj)
+    except OSError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     """``python -m acmake.cache_compile <object.o> <source> -- <compiler> [args...]``"""
     args = list(sys.argv[1:] if argv is None else argv)
@@ -49,12 +64,8 @@ def main(argv: list[str] | None = None) -> int:
     # Ninja + ``cmd.exe /C`` can leave grouped tokens as ``"@path"`` / ``"-I..."``;
     # GCC then treats them as literal filenames (``@`` response-file semantics are lost).
     compile_argv = [_strip_redundant_outer_double_quotes(a) for a in compile_argv]
-    if obj.is_file() and src.is_file():
-        try:
-            if _mtime_ns(src) <= _mtime_ns(obj):
-                return 0
-        except OSError:
-            pass
+    if should_skip_cached_compile(obj, src):
+        return 0
     r = subprocess.run(compile_argv)
     return int(r.returncode) if r.returncode is not None else 1
 
